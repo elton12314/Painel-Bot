@@ -5,17 +5,35 @@ const {
   Client,
   Events,
   GatewayIntentBits,
+  PermissionFlagsBits,
   REST,
   Routes,
   SlashCommandBuilder,
   StringSelectMenuBuilder,
 } = require("discord.js");
 
+function normalizeBaseUrl(value) {
+  const trimmed = String(value || "").trim().replace(/\/+$/, "");
+  if (!trimmed) {
+    return "";
+  }
+
+  if (/^https?:\/\//i.test(trimmed)) {
+    return trimmed;
+  }
+
+  return `https://${trimmed.replace(/^\/+/, "")}`;
+}
+
 const token = process.env.DISCORD_BOT_TOKEN || "";
 const clientId = process.env.DISCORD_BOT_CLIENT_ID || "";
 const guildId = process.env.DISCORD_BOT_GUILD_ID || "";
-const panelApiBaseUrl = (process.env.PANEL_API_BASE_URL || "").replace(/\/+$/, "");
+const panelApiBaseUrl = normalizeBaseUrl(process.env.PANEL_API_BASE_URL || "");
 const sharedSecret = process.env.DISCORD_BOT_SHARED_SECRET || "";
+const allowedRoleIds = String(process.env.DISCORD_ALLOWED_ROLE_IDS || "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
 
 if (!token || !clientId || !panelApiBaseUrl || !sharedSecret) {
   throw new Error(
@@ -26,7 +44,7 @@ if (!token || !clientId || !panelApiBaseUrl || !sharedSecret) {
 const commands = [
   new SlashCommandBuilder()
     .setName("link")
-    .setDescription("Link your Discord account to the panel")
+    .setDescription("Link this server to the panel")
     .addStringOption((option) =>
       option
         .setName("code")
@@ -35,10 +53,10 @@ const commands = [
     ),
   new SlashCommandBuilder()
     .setName("scripts")
-    .setDescription("Open your script panel in Discord"),
+    .setDescription("Open this server script panel in Discord"),
   new SlashCommandBuilder()
     .setName("logout")
-    .setDescription("Unlink your Discord account from the panel"),
+    .setDescription("Unlink this server from the panel"),
 ].map((command) => command.toJSON());
 
 function getHeaders() {
@@ -61,29 +79,76 @@ async function apiRequest(path, init = {}) {
   return { ok: res.ok, status: res.status, data };
 }
 
-async function linkAccount(discordId, code) {
+async function linkAccount(guildId, code) {
   return apiRequest("/api/bot/link", {
     method: "POST",
-    body: JSON.stringify({ discordId, code }),
+    body: JSON.stringify({ guildId, code }),
   });
 }
 
-async function listScripts(discordId) {
-  return apiRequest(`/api/bot/scripts?discordId=${encodeURIComponent(discordId)}`);
+async function listScripts(guildId) {
+  return apiRequest(`/api/bot/scripts?guildId=${encodeURIComponent(guildId)}`);
 }
 
-async function unlinkAccount(discordId) {
+async function unlinkAccount(guildId) {
   return apiRequest("/api/bot/unlink", {
     method: "POST",
-    body: JSON.stringify({ discordId }),
+    body: JSON.stringify({ guildId }),
   });
 }
 
-async function createKey(discordId, scriptId, expiresInMs) {
+async function createKey(guildId, scriptId, expiresInMs) {
   return apiRequest(`/api/bot/scripts/${encodeURIComponent(scriptId)}/keys`, {
     method: "POST",
-    body: JSON.stringify({ discordId, expiresInMs }),
+    body: JSON.stringify({ guildId, expiresInMs }),
   });
+}
+
+function getAccessError(interaction) {
+  if (!interaction.inGuild() || !interaction.guildId) {
+    return "This bot can only be used inside a server.";
+  }
+
+  if (allowedRoleIds.length > 0) {
+    const memberRoles = interaction.member?.roles;
+
+    if (Array.isArray(memberRoles)) {
+      const hasAllowedRole = allowedRoleIds.some((roleId) =>
+        memberRoles.includes(roleId),
+      );
+      if (!hasAllowedRole) {
+        return "Only members with an allowed high role can use this bot.";
+      }
+      return null;
+    }
+
+    const roleCache = memberRoles?.cache;
+    if (roleCache && typeof roleCache.has === "function") {
+      const hasAllowedRole = allowedRoleIds.some((roleId) =>
+        roleCache.has(roleId),
+      );
+      if (!hasAllowedRole) {
+        return "Only members with an allowed high role can use this bot.";
+      }
+      return null;
+    }
+
+    return "Could not verify your roles right now.";
+  }
+
+  const memberPermissions =
+    interaction.memberPermissions ||
+    interaction.member?.permissions;
+
+  if (
+    !memberPermissions ||
+    (!memberPermissions.has(PermissionFlagsBits.ManageGuild) &&
+      !memberPermissions.has(PermissionFlagsBits.Administrator))
+  ) {
+    return "Only members with a high role can use this bot.";
+  }
+
+  return null;
 }
 
 function buildScriptsMenu(scripts) {
@@ -145,105 +210,152 @@ client.once(Events.ClientReady, (readyClient) => {
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
-  if (interaction.isChatInputCommand()) {
-    if (interaction.commandName === "link") {
-      const code = interaction.options.getString("code", true);
-      const result = await linkAccount(interaction.user.id, code);
-      if (!result.ok) {
+  try {
+    if (interaction.isChatInputCommand()) {
+      const accessError = getAccessError(interaction);
+      if (accessError) {
         await interaction.reply({
-          content: result.data?.error || "Failed to link account.",
+          content: accessError,
           ephemeral: true,
         });
         return;
       }
 
-      await interaction.reply({
-        content: `Linked successfully as \`${result.data.username}\`.`,
-        ephemeral: true,
-      });
-      return;
-    }
+      if (interaction.commandName === "link") {
+        const code = interaction.options.getString("code", true);
+        const result = await linkAccount(interaction.guildId, code);
+        if (!result.ok) {
+          await interaction.reply({
+            content: result.data?.error || "Failed to link account.",
+            ephemeral: true,
+          });
+          return;
+        }
 
-    if (interaction.commandName === "scripts") {
-      const result = await listScripts(interaction.user.id);
-      if (!result.ok) {
         await interaction.reply({
           content:
-            result.data?.error ||
-            "Could not load your scripts. Make sure your Discord is linked.",
+            `Linked this server successfully as \`${result.data.username}\`.\n` +
+            "High-role members in this server can now use the bot.",
           ephemeral: true,
         });
         return;
       }
 
-      const scripts = Array.isArray(result.data?.scripts) ? result.data.scripts : [];
-      if (scripts.length === 0) {
+      if (interaction.commandName === "scripts") {
+        const result = await listScripts(interaction.guildId);
+        if (!result.ok) {
+          await interaction.reply({
+            content:
+              result.data?.error ||
+              "Could not load your scripts. Make sure your Discord is linked.",
+            ephemeral: true,
+          });
+          return;
+        }
+
+        const scripts = Array.isArray(result.data?.scripts) ? result.data.scripts : [];
+        if (scripts.length === 0) {
+          await interaction.reply({
+            content: "No scripts found in your account.",
+            ephemeral: true,
+          });
+          return;
+        }
+
         await interaction.reply({
-          content: "No scripts found in your account.",
+          content: "Choose a script to generate a key:",
+          components: [buildScriptsMenu(scripts)],
           ephemeral: true,
         });
         return;
       }
 
-      await interaction.reply({
-        content: "Choose a script to generate a key:",
-        components: [buildScriptsMenu(scripts)],
-        ephemeral: true,
+      if (interaction.commandName === "logout") {
+        const result = await unlinkAccount(interaction.guildId);
+        if (!result.ok) {
+          await interaction.reply({
+            content: result.data?.error || "Failed to unlink account.",
+            ephemeral: true,
+          });
+          return;
+        }
+
+        await interaction.reply({
+          content: `Unlinked this server from \`${result.data.username}\`.`,
+          ephemeral: true,
+        });
+        return;
+      }
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === "scripts:select") {
+      const accessError = getAccessError(interaction);
+      if (accessError) {
+        await interaction.reply({
+          content: accessError,
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const scriptId = interaction.values[0];
+      await interaction.update({
+        content: "Choose the key duration:",
+        components: [buildKeyButtons(scriptId)],
       });
       return;
     }
 
-    if (interaction.commandName === "logout") {
-      const result = await unlinkAccount(interaction.user.id);
+    if (interaction.isButton() && interaction.customId.startsWith("keygen:")) {
+      const accessError = getAccessError(interaction);
+      if (accessError) {
+        await interaction.reply({
+          content: accessError,
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const [, scriptId, preset] = interaction.customId.split(":");
+      const result = await createKey(interaction.guildId, scriptId, expiryFromPreset(preset));
+
       if (!result.ok) {
         await interaction.reply({
-          content: result.data?.error || "Failed to unlink account.",
+          content: result.data?.error || "Failed to generate key.",
           ephemeral: true,
         });
         return;
       }
 
+      const key = result.data?.key;
+      const script = result.data?.script;
+      const expiresAt = key?.expiresAt
+        ? new Date(key.expiresAt).toLocaleString("en-US")
+        : "Never";
+
       await interaction.reply({
-        content: `Unlinked successfully from \`${result.data.username}\`.`,
+        content:
+          `Script: \`${script?.name || "Unknown"}\`\n` +
+          `Key: \`${key?.key || "Unknown"}\`\n` +
+          `Expires: \`${expiresAt}\``,
         ephemeral: true,
       });
     }
-  }
+  } catch (error) {
+    console.error("Discord interaction error:", error);
 
-  if (interaction.isStringSelectMenu() && interaction.customId === "scripts:select") {
-    const scriptId = interaction.values[0];
-    await interaction.update({
-      content: "Choose the key duration:",
-      components: [buildKeyButtons(scriptId)],
-    });
-    return;
-  }
-
-  if (interaction.isButton() && interaction.customId.startsWith("keygen:")) {
-    const [, scriptId, preset] = interaction.customId.split(":");
-    const result = await createKey(interaction.user.id, scriptId, expiryFromPreset(preset));
-
-    if (!result.ok) {
-      await interaction.reply({
-        content: result.data?.error || "Failed to generate key.",
+    if (interaction.isRepliable()) {
+      const response = {
+        content: "Something went wrong while talking to the panel API.",
         ephemeral: true,
-      });
-      return;
+      };
+
+      if (interaction.deferred || interaction.replied) {
+        await interaction.followUp(response).catch(() => {});
+      } else {
+        await interaction.reply(response).catch(() => {});
+      }
     }
-
-    const key = result.data?.key;
-    const script = result.data?.script;
-    const expiresAt = key?.expiresAt
-      ? new Date(key.expiresAt).toLocaleString("en-US")
-      : "Never";
-
-    await interaction.reply({
-      content:
-        `Script: \`${script?.name || "Unknown"}\`\n` +
-        `Key: \`${key?.key || "Unknown"}\`\n` +
-        `Expires: \`${expiresAt}\``,
-      ephemeral: true,
-    });
   }
 });
 
