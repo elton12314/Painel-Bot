@@ -36,6 +36,9 @@ const commands = [
   new SlashCommandBuilder()
     .setName("scripts")
     .setDescription("Open your script panel in Discord"),
+  new SlashCommandBuilder()
+    .setName("logout")
+    .setDescription("Unlink your Discord account from the panel"),
 ].map((command) => command.toJSON());
 
 function getHeaders() {
@@ -67,6 +70,13 @@ async function linkAccount(discordId, code) {
 
 async function listScripts(discordId) {
   return apiRequest(`/api/bot/scripts?discordId=${encodeURIComponent(discordId)}`);
+}
+
+async function unlinkAccount(discordId) {
+  return apiRequest("/api/bot/unlink", {
+    method: "POST",
+    body: JSON.stringify({ discordId }),
+  });
 }
 
 async function createKey(discordId, scriptId, expiresInMs) {
@@ -182,6 +192,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
       return;
     }
+
+    if (interaction.commandName === "logout") {
+      const result = await unlinkAccount(interaction.user.id);
+      if (!result.ok) {
+        await interaction.reply({
+          content: result.data?.error || "Failed to unlink account.",
+          ephemeral: true,
+        });
+        return;
+      }
+
+      await interaction.reply({
+        content: `Unlinked successfully from \`${result.data.username}\`.`,
+        ephemeral: true,
+      });
+    }
   }
 
   if (interaction.isStringSelectMenu() && interaction.customId === "scripts:select") {
@@ -227,4 +253,3 @@ registerCommands()
     console.error("Failed to start Discord bot:", error);
     process.exit(1);
   });
-
