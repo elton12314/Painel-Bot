@@ -104,16 +104,53 @@ async function createKey(guildId, scriptId, expiresInMs) {
   });
 }
 
-function getAccessError(interaction) {
+const accessCache = new Map();
+
+async function getGuildAccess(guildId) {
+  const now = Date.now();
+  const cached = accessCache.get(guildId);
+  if (cached && cached.expiresAt > now) {
+    return cached.value;
+  }
+
+  const result = await apiRequest(
+    `/api/bot/access?guildId=${encodeURIComponent(guildId)}`,
+  );
+  const value = result.ok
+    ? {
+        linked: Boolean(result.data?.linked),
+        allowedRoleIds: Array.isArray(result.data?.allowedRoleIds)
+          ? result.data.allowedRoleIds
+              .map((roleId) => String(roleId).trim())
+              .filter(Boolean)
+          : [],
+      }
+    : { linked: false, allowedRoleIds: [] };
+
+  accessCache.set(guildId, {
+    value,
+    expiresAt: now + 30_000,
+  });
+
+  return value;
+}
+
+async function getAccessError(interaction) {
   if (!interaction.inGuild() || !interaction.guildId) {
     return "This bot can only be used inside a server.";
   }
 
-  if (allowedRoleIds.length > 0) {
+  const guildAccess = await getGuildAccess(interaction.guildId);
+  const requiredRoleIds =
+    guildAccess.allowedRoleIds.length > 0
+      ? guildAccess.allowedRoleIds
+      : allowedRoleIds;
+
+  if (requiredRoleIds.length > 0) {
     const memberRoles = interaction.member?.roles;
 
     if (Array.isArray(memberRoles)) {
-      const hasAllowedRole = allowedRoleIds.some((roleId) =>
+      const hasAllowedRole = requiredRoleIds.some((roleId) =>
         memberRoles.includes(roleId),
       );
       if (!hasAllowedRole) {
@@ -124,7 +161,7 @@ function getAccessError(interaction) {
 
     const roleCache = memberRoles?.cache;
     if (roleCache && typeof roleCache.has === "function") {
-      const hasAllowedRole = allowedRoleIds.some((roleId) =>
+      const hasAllowedRole = requiredRoleIds.some((roleId) =>
         roleCache.has(roleId),
       );
       if (!hasAllowedRole) {
@@ -212,7 +249,7 @@ client.once(Events.ClientReady, (readyClient) => {
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.isChatInputCommand()) {
-      const accessError = getAccessError(interaction);
+      const accessError = await getAccessError(interaction);
       if (accessError) {
         await interaction.reply({
           content: accessError,
@@ -289,7 +326,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId === "scripts:select") {
-      const accessError = getAccessError(interaction);
+      const accessError = await getAccessError(interaction);
       if (accessError) {
         await interaction.reply({
           content: accessError,
@@ -307,7 +344,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith("keygen:")) {
-      const accessError = getAccessError(interaction);
+      const accessError = await getAccessError(interaction);
       if (accessError) {
         await interaction.reply({
           content: accessError,
